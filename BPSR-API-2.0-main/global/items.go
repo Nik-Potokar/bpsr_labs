@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"log"
+	"strconv"
 	"sync"
 )
 
@@ -28,13 +29,10 @@ func InitItemCatalog() {
 
 	// Convert string keys to integers
 	for idStr, name := range rawCatalog {
-		var id int
-		_, err := json.Unmarshal([]byte(idStr), &id)
+		id, err := strconv.Atoi(idStr)
 		if err != nil {
-			// Try parsing as string number
-			if _, scanErr := json.Unmarshal([]byte("\""+idStr+"\""), &id); scanErr != nil {
-				continue
-			}
+			// Skip invalid IDs
+			continue
 		}
 		ItemCatalog[id] = name
 	}
