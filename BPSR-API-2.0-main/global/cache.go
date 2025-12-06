@@ -122,3 +122,83 @@ func UpdateScene(callback func(*SceneInfo)) {
 	callback(CurrentScene)
 
 }
+
+// Market listing data
+var MarketListings = make(map[string]*MarketListing)
+var MarketListingsLock = sync.RWMutex{}
+
+type MarketListing struct {
+	ListingGUID string `json:"listing_guid"`
+	ItemID      int    `json:"item_id"`
+	ItemName    string `json:"item_name"`
+	PriceLuno   int    `json:"price_luno"`
+	Quantity    int    `json:"quantity"`
+	BindFlag    bool   `json:"bind_flag"`
+	ListedAt    int64  `json:"listed_at"`   // Unix timestamp when listed
+	CapturedAt  int64  `json:"captured_at"` // When we captured this
+	UnitPrice   int    `json:"unit_price"`  // Price per item
+}
+
+// Price history for analytics
+var PriceHistory = make(map[int][]PriceRecord)
+var PriceHistoryLock = sync.RWMutex{}
+
+type PriceRecord struct {
+	ItemID     int   `json:"item_id"`
+	PriceLuno  int   `json:"price_luno"`
+	Quantity   int   `json:"quantity"`
+	RecordedAt int64 `json:"recorded_at"`
+}
+
+// AddMarketListing adds a new market listing and records it in price history
+func AddMarketListing(listing *MarketListing) {
+	MarketListingsLock.Lock()
+	MarketListings[listing.ListingGUID] = listing
+	MarketListingsLock.Unlock()
+
+	// Record in price history
+	PriceHistoryLock.Lock()
+	defer PriceHistoryLock.Unlock()
+
+	history := PriceHistory[listing.ItemID]
+	history = append(history, PriceRecord{
+		ItemID:     listing.ItemID,
+		PriceLuno:  listing.PriceLuno,
+		Quantity:   listing.Quantity,
+		RecordedAt: listing.CapturedAt,
+	})
+
+	// Keep only last 1000 records per item
+	if len(history) > 1000 {
+		history = history[len(history)-1000:]
+	}
+
+	PriceHistory[listing.ItemID] = history
+}
+
+// CleanOldListings removes listings older than maxAge seconds
+func CleanOldListings(maxAge int64) int {
+	MarketListingsLock.Lock()
+	defer MarketListingsLock.Unlock()
+
+	now := time.Now().Unix()
+	removed := 0
+	for guid, listing := range MarketListings {
+		if now-listing.CapturedAt > maxAge {
+			delete(MarketListings, guid)
+			removed++
+		}
+	}
+	return removed
+}
+
+// ClearMarketData clears all market listings and price history
+func ClearMarketData() {
+	MarketListingsLock.Lock()
+	MarketListings = make(map[string]*MarketListing)
+	MarketListingsLock.Unlock()
+
+	PriceHistoryLock.Lock()
+	PriceHistory = make(map[int][]PriceRecord)
+	PriceHistoryLock.Unlock()
+}

@@ -19,10 +19,12 @@ import (
 )
 
 var (
-	networkCard   = flag.String("network", "", "Enter network card full description, auto for automatic selection")
-	port          = flag.Int("port", 8989, "Default API port")
-	expireTime    = flag.Int64("expire", 10, "Data expiration time (seconds), default 10s")
-	autoCheckTime = flag.Int("autoCheckTime", 3, "Auto check active network card time (seconds)")
+	networkCard      = flag.String("network", "", "Enter network card full description, auto for automatic selection")
+	port             = flag.Int("port", 8989, "Default API port")
+	expireTime       = flag.Int64("expire", 10, "Data expiration time (seconds), default 10s")
+	autoCheckTime    = flag.Int("autoCheckTime", 3, "Auto check active network card time (seconds)")
+	marketDataFile   = flag.String("marketData", "market_listings.json", "Path to market data JSON file")
+	marketReloadMins = flag.Int("marketReload", 5, "Market data reload interval (minutes)")
 )
 
 func main() {
@@ -70,6 +72,12 @@ func main() {
 
 	// Load monster JSON list
 	global.InitMonsterNames()
+
+	// Load item catalog
+	global.InitItemCatalog()
+
+	// Start market data reloader
+	global.StartMarketDataReloader(*marketDataFile, *marketReloadMins)
 
 	// Start services
 	go Openapi()
@@ -180,6 +188,198 @@ func Openapi() {
 			"data": global.CurrentScene,
 		})
 	})
+
+	// Market API endpoints
+	s.GET("/api/market/listings", func(ctx *gin.Context) {
+		global.MarketListingsLock.RLock()
+		defer global.MarketListingsLock.RUnlock()
+
+		// Optional filters
+		itemIDStr := ctx.Query("item_id")
+		minPriceStr := ctx.Query("min_price")
+		maxPriceStr := ctx.Query("max_price")
+
+		listings := make([]*global.MarketListing, 0)
+		for _, listing := range global.MarketListings {
+			// Apply filters
+			if itemIDStr != "" {
+				var itemID int
+				fmt.Sscanf(itemIDStr, "%d", &itemID)
+				if listing.ItemID != itemID {
+					continue
+				}
+			}
+
+			if minPriceStr != "" {
+				var minPrice int
+				fmt.Sscanf(minPriceStr, "%d", &minPrice)
+				if listing.PriceLuno < minPrice {
+					continue
+				}
+			}
+
+			if maxPriceStr != "" {
+				var maxPrice int
+				fmt.Sscanf(maxPriceStr, "%d", &maxPrice)
+				if listing.PriceLuno > maxPrice {
+					continue
+				}
+			}
+
+			listings = append(listings, listing)
+		}
+
+		ctx.JSON(200, gin.H{
+			"code": 0,
+			"msg":  "OK",
+			"data": gin.H{
+				"listings": listings,
+				"count":    len(listings),
+			},
+		})
+	})
+
+	s.GET("/api/items/:id", func(ctx *gin.Context) {
+		itemIDStr := ctx.Param("id")
+		var itemID int
+		_, err := fmt.Sscanf(itemIDStr, "%d", &itemID)
+		if err != nil {
+			ctx.JSON(400, gin.H{
+				"code": 1,
+				"msg":  "Invalid item ID",
+			})
+			return
+		}
+
+		itemName := global.GetItemName(itemID)
+		if itemName == "" {
+			ctx.JSON(404, gin.H{
+				"code": 1,
+				"msg":  "Item not found",
+			})
+			return
+		}
+
+		ctx.JSON(200, gin.H{
+			"code": 0,
+			"msg":  "OK",
+			"data": gin.H{
+				"item_id":   itemID,
+				"item_name": itemName,
+			},
+		})
+	})
+
+	s.GET("/api/market/prices/:id", func(ctx *gin.Context) {
+		itemIDStr := ctx.Param("id")
+		var itemID int
+		_, err := fmt.Sscanf(itemIDStr, "%d", &itemID)
+		if err != nil {
+			ctx.JSON(400, gin.H{
+				"code": 1,
+				"msg":  "Invalid item ID",
+			})
+			return
+		}
+
+		global.PriceHistoryLock.RLock()
+		defer global.PriceHistoryLock.RUnlock()
+
+		history, exists := global.PriceHistory[itemID]
+		if !exists || len(history) == 0 {
+			ctx.JSON(404, gin.H{
+				"code": 1,
+				"msg":  "No price history available",
+			})
+			return
+		}
+
+		// Calculate statistics
+		var total int
+		min := history[0].PriceLuno
+		max := history[0].PriceLuno
+
+		for _, record := range history {
+			total += record.PriceLuno
+			if record.PriceLuno < min {
+				min = record.PriceLuno
+			}
+			if record.PriceLuno > max {
+				max = record.PriceLuno
+			}
+		}
+
+		avg := total / len(history)
+
+		ctx.JSON(200, gin.H{
+			"code": 0,
+			"msg":  "OK",
+			"data": gin.H{
+				"item_id":   itemID,
+				"item_name": global.GetItemName(itemID),
+				"history":   history,
+				"stats": gin.H{
+					"average": avg,
+					"min":     min,
+					"max":     max,
+					"count":   len(history),
+				},
+			},
+		})
+	})
+
+	s.GET("/api/items/search", func(ctx *gin.Context) {
+		query := ctx.Query("q")
+		if query == "" {
+			ctx.JSON(400, gin.H{
+				"code": 1,
+				"msg":  "Missing search query",
+			})
+			return
+		}
+
+		global.ItemCatalogLock.RLock()
+		defer global.ItemCatalogLock.RUnlock()
+
+		results := make([]gin.H, 0)
+		queryLower := fmt.Sprintf("%s", query)
+
+		for itemID, itemName := range global.ItemCatalog {
+			itemNameLower := fmt.Sprintf("%s", itemName)
+			// Simple case-insensitive contains search
+			if len(itemNameLower) > 0 && len(queryLower) > 0 {
+				// Check if query is in item name (simple substring match)
+				found := false
+				for i := 0; i <= len(itemNameLower)-len(queryLower); i++ {
+					if itemNameLower[i:i+len(queryLower)] == queryLower {
+						found = true
+						break
+					}
+				}
+				if found {
+					results = append(results, gin.H{
+						"item_id":   itemID,
+						"item_name": itemName,
+					})
+
+					// Limit to 50 results
+					if len(results) >= 50 {
+						break
+					}
+				}
+			}
+		}
+
+		ctx.JSON(200, gin.H{
+			"code": 0,
+			"msg":  "OK",
+			"data": gin.H{
+				"results": results,
+				"count":   len(results),
+			},
+		})
+	})
+
 	log.Println(fmt.Sprintf("Service started at: http://127.0.0.1:%d", *port))
 	if err := s.Run(fmt.Sprintf(":%d", *port)); err != nil {
 		log.Printf("ERROR: API server failed: %s", err.Error())
